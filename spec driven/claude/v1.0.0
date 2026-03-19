@@ -1,0 +1,364 @@
+# SARFBIO — Contexto Técnico Completo para LLM
+
+## Descripción del Proyecto
+
+**SARFBIO** es un sistema de riego automatizado con brazo robótico basado en ESP32.
+El sistema mueve un brazo mecánico de 3 grados de libertad sobre un eje de rotación
+controlado por un motor paso a paso, riega plantas en dos posiciones de altura (alta y baja),
+y desplaza el vehículo hacia adelante cada ciclo. Cada tres ciclos, el vehículo retrocede
+a su posición de origen.
+
+---
+
+## Hardware — Componentes
+
+### Microcontrolador
+- **ESP32 Dev Module** (30 pines), dual-core 240MHz, WiFi+BT
+- Voltaje lógico: 3.3V. Los GPIO son tolerantes a 3.3V únicamente.
+- Sistema operativo de desarrollo: Windows 10/11 (64-bit)
+- IDE: Arduino IDE 1.8.x / 2.3.x
+
+### Pantalla OLED
+- **Adafruit SSD1306** — 0.96", 128×64 píxeles, interfaz I2C
+- Dirección I2C: `0x3C`
+- SDA → GPIO 21, SCL → GPIO 22
+- Alimentación: 3.3V
+
+### Servos del Brazo Robótico
+Kit base: **TA0262 Arduino Robot Arm 4-DOF Mechanical Claw**
+El servo de base del kit fue reemplazado por el motor paso a paso.
+
+| ID | Nombre | Modelo | GPIO | Pulso mín | Pulso máx |
+|----|--------|--------|------|-----------|-----------|
+| SA | Hombro | MG90S | 14 | 500 µs | 2400 µs |
+| SB | Codo | MG90S | 13 | 500 µs | 2400 µs |
+| SC | Pinza | SG90 | 15 | 544 µs | 2400 µs |
+
+**Diferencia crítica MG90S vs SG90:**
+- MG90S: `attach(pin, 500, 2400)` — pulso mínimo 500 µs
+- SG90: `attach(pin, 544, 2400)` — pulso mínimo 544 µs (llega exacto a 0°)
+
+### Motor Paso a Paso (base de rotación)
+- **28BYJ-48** con driver **ULN2003**
+- Unipolar, 4 fases, 2048 pasos/vuelta completa
+- 90° = 512 pasos (`PASOS_90 = 512`)
+- **Orden de pines cruzado obligatorio** para AccelStepper:
+  - `STEP_PIN1 = 19` (IN1)
+  - `STEP_PIN2 = 5` (IN3) ← cruzado
+  - `STEP_PIN3 = 18` (IN2) ← cruzado
+  - `STEP_PIN4 = 17` (IN4)
+- Si el orden NO está cruzado: el motor vibra pero no gira.
+- Velocidad: `setMaxSpeed(800.0)`, `setAcceleration(300.0)`
+- Las bobinas se apagan con `motor.disableOutputs()` cuando está en reposo
+  para evitar calentamiento.
+
+### Driver L298N — Puente H Dual
+Controla la bomba (Canal A) y el motor DC (Canal B).
+
+| Canal | Componente | ENA/ENB | IN+ | IN- | OUT |
+|-------|-----------|---------|-----|-----|-----|
+| A | Bomba de agua | GPIO 25 | GPIO 26 | GPIO 27 | OUT1/OUT2 |
+| B | Motor DC ruedas | GPIO 16 | GPIO 4 | GPIO 2 | OUT3/OUT4 |
+
+**Nota GPIO 2:** comparte el LED onboard del ESP32. Parpadea al activar
+marcha atrás. No afecta el funcionamiento. Debe estar en LOW al encender.
+
+**Nota GPIO 34:** es input-only en ESP32. No usar para salidas digitales.
+
+**Jumper 5V del L298N:** debe dejarse puesto cuando Vs ≤ 12V (alimentación USB).
+
+### Bomba de Agua
+- **Sumergible 120 L/H**, 2.5-6V DC, sin escobillas, conducción magnética
+- Solo gira en un sentido (no requiere inversión)
+- IN1=HIGH, IN2=LOW siempre
+- Velocidad máxima PWM: `BOMBA_VEL_MAX = 90` (de 255) — la mitad evita caudal excesivo
+- Rampa de encendido/apagado: incrementos de 2 en 2, delay 30ms por paso
+
+### Motor DC con Caja Reductora (ruedas)
+- **3-6VDC**, 200RPM a 6V, reducción 1:48, diámetro rueda 6.8cm
+- Umbral de arranque real: **PWM ≥ 145** (por debajo vibra sin girar)
+- Configuración operativa: `MOTOR_VEL_MAX = 220`, `MOTOR_VEL_MIN = 150`
+- Tiempo por vuelta calibrado: `MS_POR_VUELTA = 400` ms
+- **Problema resuelto:** los `ESP32PWM::allocateTimer()` de los servos
+  reasignan los timers LEDC y desvinculan el canal del motor DC.
+  **Solución:** reconectar LEDC de motor y bomba DESPUÉS del attach de los servos,
+  dentro de `arranqueSuave()`, no en `setup()`.
+
+---
+
+## Software — Librerías
+
+| Librería | Versión mínima | Uso |
+|----------|---------------|-----|
+| `Wire.h` | built-in | I2C para OLED |
+| `Adafruit_GFX.h` | 1.11.x | Primitivas gráficas |
+| `Adafruit_SSD1306.h` | 2.5.x | Driver OLED |
+| `ESP32Servo.h` | última | Control servos MG90S y SG90 en ESP32 |
+| `AccelStepper.h` | 1.64.0 | Control suave del 28BYJ-48 |
+
+**Instalación AccelStepper:** Programa → Incluir Librería → Gestionar Bibliotecas
+→ buscar "AccelStepper" → autor Mike McCauley → Instalar.
+
+---
+
+## Configuración PWM (LEDC del ESP32)
+
+```cpp
+#define PWM_BOMBA   6      // Canal LEDC 6
+#define PWM_MOTOR   7      // Canal LEDC 7
+#define PWM_FREQ  500      // Hz — balance torque/calor para DC con escobillas
+#define PWM_RES     8      // bits → valores 0-255
+```
+
+**Por qué canales 6 y 7:** los canales 0-5 son usados internamente por
+`ESP32PWM` (librería de servos). Usar 0-5 para LEDC propio causa conflictos.
+
+**Por qué 500 Hz:** a 1000 Hz el motor DC con escobillas genera zumbido
+audible y menos torque. A 50 Hz funciona pero es más lento de respuesta.
+500 Hz es el balance óptimo encontrado empíricamente.
+
+---
+
+## Mapa de Pines Completo
+
+| GPIO | Función | Componente | Notas |
+|------|---------|-----------|-------|
+| 2 | IN4 Motor DC | L298N | Comparte LED onboard, LOW al boot |
+| 4 | IN3 Motor DC | L298N | |
+| 5 | STEP_PIN2 (IN3) | ULN2003 | Orden cruzado |
+| 13 | SB Codo | MG90S | |
+| 14 | SA Hombro | MG90S | |
+| 15 | SC Pinza | SG90 | |
+| 16 | ENB Motor DC PWM | L298N | |
+| 17 | STEP_PIN4 (IN4) | ULN2003 | |
+| 18 | STEP_PIN3 (IN2) | ULN2003 | Orden cruzado |
+| 19 | STEP_PIN1 (IN1) | ULN2003 | |
+| 21 | SDA | OLED | |
+| 22 | SCL | OLED | |
+| 25 | ENA Bomba PWM | L298N | |
+| 26 | IN1 Bomba | L298N | |
+| 27 | IN2 Bomba | L298N | |
+
+**Pines a evitar para señal:** GPIO 0 (boot), GPIO 1 (TX), GPIO 12 (afecta arranque),
+GPIO 34/35/36/39 (input-only, no pueden emitir señal).
+
+---
+
+## Posiciones del Brazo
+
+| Posición | Nombre | SA (Hombro) | SB (Codo) | SC (Pinza) |
+|----------|--------|------------|----------|-----------|
+| PA | Inicial / reposo | 45° | 90° | sin cambio |
+| PB | Riego alto | 110° | 160° | oscila 45°↔90° × 5 |
+| PC | Riego bajo | 120° | 90° | oscila 45°↔90° × 5 |
+
+**PA nota:** SC no se activa en posición A. Permanece en su última posición.
+
+---
+
+## Lógica de Movimiento de Servos
+
+### Movimiento armónico SA + SB (`moverBrazo`)
+SA y SB se mueven simultáneamente usando acumuladores de fracción:
+- Se calcula la distancia de cada servo al destino
+- El servo con mayor distancia marca el ritmo (maxDist)
+- Cada servo avanza proporcionalmente para llegar al mismo tiempo
+- OLED se actualiza cada 4 pasos (no en cada grado) para no saturar I2C
+- `delayMicroseconds(500)` después de cada `write()` para estabilizar PWM
+
+```cpp
+// Velocidades ms por grado:
+VEL_ARRANQUE = 50   // solo al encender — muy lento
+VEL_LENTO    = 25   // movimiento normal entre posiciones
+VEL_NORMAL   = 15   // oscilación SC durante riego
+```
+
+### Arranque suave (anti-golpe)
+Al energizar, los servos saltan bruscamente si no reciben posición inmediata.
+Estrategia implementada:
+1. `attach()` + `write(90)` sin delay entre medio → servo recibe posición antes
+   de que el driver active corriente fuerte
+2. Todos los servos van a 90° (neutro) primero
+3. Luego se mueven lentamente a PA con `VEL_ARRANQUE = 50`
+
+### Oscilación SC con bomba (`oscilarSCconBomba`)
+- SC oscila entre `SC_MIN` y `SC_MAX` N veces
+- Bomba sube gradualmente en la oscilación 1
+- Bomba baja gradualmente en la oscilación (N-2) — termina antes del fin
+- Las funciones `bombaRampaSubir/Bajar` NO tocan la OLED para no interrumpir
+  el movimiento suave de los servos
+
+---
+
+## Lógica del Motor Paso a Paso
+
+- Se mueve a `+PASOS_90` (+512) para girar 90° a la derecha
+- Se mueve a `-PASOS_90` (-512) para girar 90° a la izquierda
+- Regresa a posición 0 después de cada riego
+- Se desenergetiza con `motor.disableOutputs()` en reposo
+- OLED se actualiza cada 3 pasos para no frenar el stepper
+
+---
+
+## Lógica del Motor DC (ruedas)
+
+```cpp
+MOTOR_VEL_MAX   = 220    // PWM máximo
+MOTOR_VEL_MIN   = 150    // umbral de arranque real ≈ 145
+MOTOR_VUELTA    = 1.5    // vueltas por avance normal
+MS_POR_VUELTA   = 400    // ms calibrado para 1 vuelta
+```
+
+Función `motorVueltas(float vueltas, bool adelante)`:
+1. Establece dirección
+2. Rampa subida de `MOTOR_VEL_MIN` a `MOTOR_VEL_MAX` en 50ms total
+3. Mantiene velocidad máxima durante `vueltas × 400` ms
+4. Rampa bajada de `MOTOR_VEL_MAX` a `MOTOR_VEL_MIN` en 50ms total
+5. Apagado y freno
+
+---
+
+## Secuencia Principal del Loop
+
+```
+ARRANQUE SUAVE (una sola vez al encender)
+│
+└─► LOOP (se repite indefinidamente)
+    │
+    ├── Paso 1:  PA — brazo recogido, stepper desactivado
+    ├── Paso 2:  Stepper +512 pasos (90° derecha)
+    ├── Paso 3:  PB — SA+SB a riego alto
+    ├── Paso 4:  SC oscila × 5, bomba sube/baja integrada
+    ├── Paso 5:  Regresa a PA
+    ├── Paso 6:  Stepper regresa a 0
+    ├── Paso 7:  Stepper -512 pasos (90° izquierda)
+    ├── Paso 8:  PC — SA+SB a riego bajo
+    ├── Paso 9:  SC oscila × 5, bomba sube/baja integrada
+    ├── Paso 10: Regresa a PA
+    ├── Paso 11: Stepper regresa a 0
+    ├── Paso 12: Motor DC avanza MOTOR_VUELTA vueltas
+    ├── Paso 13: ciclo++
+    │
+    └── Si ciclo >= 3:
+        ├── Motor DC retrocede 3 × MOTOR_VUELTA vueltas
+        └── ciclo = 0  →  reinicia desde Paso 1
+```
+
+---
+
+## Estrategias y Decisiones de Diseño
+
+### 1. Conflicto ESP32PWM vs LEDC
+`ESP32Servo` usa `ESP32PWM::allocateTimer()` internamente, lo que reasigna
+los timers LEDC y desvincula cualquier canal LEDC configurado antes.
+**Solución:** configurar `ledcSetup` + `ledcAttachPin` de motor DC y bomba
+SIEMPRE después del último `servo.attach()`, dentro de `arranqueSuave()`.
+Los comentarios en `setup()` están deliberadamente eliminados del bloque LEDC.
+
+### 2. Canales LEDC 6 y 7
+Los canales 0-5 del ESP32 son tomados por `ESP32PWM` para los servos.
+Usar `PWM_BOMBA = 6` y `PWM_MOTOR = 7` evita el conflicto.
+
+### 3. Orden cruzado del 28BYJ-48
+La secuencia física de bobinas del motor no sigue el orden del conector JST.
+AccelStepper requiere: `FULL4WIRE(IN1, IN3, IN2, IN4)` — no `(IN1, IN2, IN3, IN4)`.
+Con el orden incorrecto: vibra pero no gira.
+
+### 4. OLED — actualización selectiva
+Actualizar la OLED en cada iteración (cada grado de servo) satura el bus I2C
+y hace que los servos se muevan en saltos. Solución: actualizar cada N pasos
+(`i % 4 == 0` en `moverBrazo`, cada 3 pasos en `moverStepper`).
+
+### 5. Bomba sin interferir en OLED
+`bombaRampaSubir/Bajar` no llaman `oledBarra` ni `oledEstado`. Si lo hacen,
+sobreescriben la pantalla de los servos y el delay de la rampa bloquea el loop
+causando saltos bruscos en el movimiento de los servos.
+
+### 6. GPIO 2 como IN4
+GPIO 2 es input-only-safe y comparte el LED onboard. Funciona perfectamente
+para señal digital de dirección (solo recibe HIGH/LOW). El LED parpadea
+al activar marcha atrás — comportamiento esperado, no un error.
+
+### 7. Frecuencia PWM 500 Hz
+Encontrada empíricamente. A 1000 Hz el motor DC zumbaba sin girar hasta
+PWM ≥ 145. A 500 Hz el umbral de arranque baja y el torque mejora.
+
+### 8. `delayMicroseconds(500)` post-write
+Agrega una micro-pausa después de cada `servo.write()` para que el PWM
+se estabilice antes de la siguiente escritura. Evita glitches en servos
+MG90S que son más sensibles que el SG90.
+
+---
+
+## Variables Globales Clave
+
+```cpp
+int  angSA    = 90;    // ángulo actual SA — se actualiza en cada movimiento
+int  angSB    = 90;    // ángulo actual SB
+int  angSC    = 45;    // ángulo actual SC
+long posMotor = 0;     // posición actual stepper en pasos
+int  ciclo    = 0;     // contador de ciclos (0-2, reset en 3)
+```
+
+---
+
+## Constantes de Calibración Ajustables
+
+```cpp
+// Servos
+PA_SA = 45,  PA_SB = 90              // posición inicial
+PB_SA = 110, PB_SB = 160             // riego alto
+PC_SA = 120, PC_SB = 90              // riego bajo
+PB_SC_MIN = 45, PB_SC_MAX = 90       // oscilación pinza riego alto
+PC_SC_MIN = 45, PC_SC_MAX = 90       // oscilación pinza riego bajo
+OSCILACIONES = 5                     // veces que oscila SC al regar
+
+// Motor DC
+MOTOR_VEL_MAX  = 220    // ajustar si motor no llega a velocidad
+MOTOR_VEL_MIN  = 150    // ajustar si motor no arranca
+BOMBA_VEL_MAX  = 90     // ajustar caudal de la bomba
+MOTOR_VUELTA   = 1.5    // vueltas por ciclo de avance
+MS_POR_VUELTA  = 400    // calibrar cronometrando 1 vuelta real
+
+// Stepper
+PASOS_90 = 512           // fijo para 28BYJ-48 (2048/4)
+motor.setMaxSpeed(800.0)
+motor.setAcceleration(300.0)
+```
+
+---
+
+## OLED — Layout de Pantalla Principal
+
+```
+┌─────────────────────────────┐
+│ SARFBIO              C: 2   │  ← título + contador de ciclo
+├─────────────────────────────┤
+│ PA Inicial      moviendo    │  ← posición activa + acción
+├──────────┬──────────┬───────┤
+│ SA       │ SB       │ SC    │
+│  45°     │  90°     │  45°  │  ← ángulos en tiempo real (textSize 2)
+├──────────┴──────────┴───────┤
+│ Step: 512p                  │  ← posición stepper en pasos
+│ ════════════|═══════════    │  ← barra con marca central en 0
+└─────────────────────────────┘
+```
+
+---
+
+## Errores Conocidos y Soluciones
+
+| Error | Causa | Solución |
+|-------|-------|----------|
+| Servos no se mueven o saltan | LEDC configurado antes del servo attach | Mover `ledcSetup` después de todos los `servo.attach()` |
+| Motor DC no gira | Canal LEDC desvinculado por ESP32PWM | Reconectar en `arranqueSuave()` después de servos |
+| Stepper vibra sin girar | Orden de pines incorrecto | Usar orden cruzado: IN1, IN3, IN2, IN4 |
+| Motor DC zumba sin girar | PWM_FREQ muy alto o VEL_MIN muy bajo | Bajar PWM_FREQ a 500Hz, subir MOTOR_VEL_MIN |
+| OLED muestra texto incorrecto al regar | bombaRampa llama oledBarra | Eliminar llamadas OLED dentro de bombaRampa |
+| Servos se mueven en saltos | OLED actualizada en cada grado | Actualizar cada N pasos (i % 4) |
+| GPIO 34 no emite señal | Input-only en ESP32 | Usar GPIO 16 u otro bidireccional |
+
+---
+
+*SARFBIO v1.0 — Sistema Autónomo de Riego con Brazo Robótico*
+*ESP32 + 28BYJ-48 + 3× MG90S/SG90 + L298N + Bomba 120L/H*
