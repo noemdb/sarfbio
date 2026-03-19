@@ -1,0 +1,579 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include <AccelStepper.h>
+#include <math.h>
+
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1
+#define SCREEN_ADDRESS 0x3C
+
+// ── Servos ──
+#define SA_PIN  14
+#define SB_PIN  13
+#define SC_PIN  15
+#define SA_MIN   0
+#define SA_MAX 180
+#define SB_MIN   0
+#define SB_MAX 180
+#define SC_MIN   0
+#define SC_MAX 180
+#define MG90S_MIN  500
+#define MG90S_MAX 2400
+#define SG90_MIN   544
+#define SG90_MAX  2400
+
+// ── Stepper ──
+#define STEP_PIN1 19
+#define STEP_PIN2  5
+#define STEP_PIN3 18
+#define STEP_PIN4 17
+#define PASOS_90  512
+
+// ── L298N Canal A — Bomba ──
+#define ENA  25
+#define IN1  26
+#define IN2  27
+
+// ── L298N Canal B — Motor DC ──
+#define ENB  16
+#define IN3   4
+#define IN4   2
+
+// ── PWM ──
+#define PWM_BOMBA   6
+#define PWM_MOTOR   7
+#define PWM_FREQ  500
+#define PWM_RES     8
+
+// ── Posiciones brazo ──
+#define PA_SA   45
+#define PA_SB   90
+#define PB_SA  110
+#define PB_SB  160
+#define PB_SC_MIN  45
+#define PB_SC_MAX  90
+#define PC_SA  120
+#define PC_SB   90
+#define PC_SC_MIN  45
+#define PC_SC_MAX  90
+#define OSCILACIONES  5
+
+// ── Motor DC ──
+#define MOTOR_VEL_MAX   220
+#define MOTOR_VEL_MIN   150
+#define BOMBA_VEL_MAX    90
+#define MOTOR_VUELTA    1.5f
+#define MS_POR_VUELTA   400
+
+// ── Velocidades servos ──
+#define VEL_ARRANQUE  50
+#define VEL_LENTO     25
+#define VEL_NORMAL    15
+
+// ══════════════════════════════════════════
+// ESTADOS FSM — todos en el enum
+// ══════════════════════════════════════════
+enum Estado {
+  // Estados principales
+  ST_INIT,
+  ST_PA,
+  ST_STEP_DER,
+  ST_PB_BRAZO,
+  ST_PB_RIEGO,
+  ST_PA_DESDE_PB,
+  ST_STEP_0_A,
+  ST_STEP_IZQ,
+  ST_PC_BRAZO,
+  ST_PC_RIEGO,
+  ST_PA_DESDE_PC,
+  ST_STEP_0_B,
+  ST_MOTOR_AVZ,
+  ST_CICLO_INC,
+  ST_MOTOR_RET,
+  ST_RESET_CICLO,
+
+  // Estados de espera genéricos
+  ST_WAIT_BRAZO,   // espera fin de moverBrazoTick()
+  ST_WAIT_PAUSA,   // espera millis() >= pausaFin
+  ST_WAIT_STEP,    // espera fin del stepper
+  ST_WAIT_OSC,     // espera fin oscilación SC
+  ST_WAIT_MOTOR,   // espera fin motorTick()
+};
+
+// ══════════════════════════════════════════
+// OBJETOS
+// ══════════════════════════════════════════
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Servo SA, SB, SC;
+AccelStepper stepper(AccelStepper::FULL4WIRE,
+                     STEP_PIN1, STEP_PIN2,
+                     STEP_PIN3, STEP_PIN4);
+
+// ── Variables globales ──
+int  angSA    = 90;
+int  angSB    = 90;
+int  angSC    = 45;
+long posMotor = 0;
+int  ciclo    = 0;
+
+Estado estado    = ST_INIT;
+Estado estadoSig = ST_PA;    // próximo tras estado de espera
+
+unsigned long lastOled = 0;
+unsigned long pausaFin = 0;
+
+// ══════════════════════════════════════════
+// CONTEXTO MOVER BRAZO
+// ══════════════════════════════════════════
+struct MoverCtx {
+  int   startSA, startSB;
+  int   destSA,  destSB;
+  int   pasos,   paso;
+  int   velBase;
+  bool  activo;
+  const char* pos;
+  const char* accion;
+} mv;
+
+void moverBrazoInicia(int dSA, int dSB, int vel,
+                      const char* pos, const char* accion) {
+  mv.startSA = angSA;
+  mv.startSB = angSB;
+  mv.destSA  = constrain(dSA, SA_MIN, SA_MAX);
+  mv.destSB  = constrain(dSB, SB_MIN, SB_MAX);
+  mv.pasos   = max(abs(mv.destSA - mv.startSA),
+                   abs(mv.destSB - mv.startSB));
+  mv.paso    = 0;
+  mv.velBase = vel;
+  mv.pos     = pos;
+  mv.accion  = accion;
+  mv.activo  = (mv.pasos > 0);
+}
+
+// true = sigue moviendo, false = terminó
+bool moverBrazoTick() {
+  if (!mv.activo) return false;
+  if (mv.paso > mv.pasos) {
+    angSA = mv.destSA; angSB = mv.destSB;
+    SA.write(angSA);   SB.write(angSB);
+    mv.activo = false;
+    return false;
+  }
+  float t      = (float)mv.paso / mv.pasos;
+  float smooth = (1.0f - cosf(t * PI)) * 0.5f;
+  angSA = mv.startSA + (int)((mv.destSA - mv.startSA) * smooth);
+  angSB = mv.startSB + (int)((mv.destSB - mv.startSB) * smooth);
+  SA.write(angSA);
+  SB.write(angSB);
+  mv.paso++;
+  return true;
+}
+
+// ══════════════════════════════════════════
+// CONTEXTO OSCILACIÓN SC + BOMBA
+// ══════════════════════════════════════════
+struct OscCtx {
+  int   minA, maxA;
+  int   veces, vel;
+  int   osc;
+  int   angActual;
+  int   dir;
+  bool  activo;
+  const char* pos;
+} osc;
+
+void oscIniciar(int minA, int maxA, int veces,
+                int vel, const char* pos) {
+  osc.minA      = minA;
+  osc.maxA      = maxA;
+  osc.veces     = veces;
+  osc.vel       = vel;
+  osc.osc       = 0;
+  osc.angActual = angSC;
+  osc.dir       = 1;
+  osc.activo    = true;
+  osc.pos       = pos;
+}
+
+// true = sigue, false = terminó
+bool oscTick() {
+  if (!osc.activo) return false;
+  osc.angActual += osc.dir;
+  angSC = osc.angActual;
+  SC.write(angSC);
+
+  if (osc.dir == 1 && osc.angActual >= osc.maxA) {
+    osc.dir = -1;
+  } else if (osc.dir == -1 && osc.angActual <= osc.minA) {
+    osc.dir = 1;
+    osc.osc++;
+    if (osc.osc == 1) {
+      digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+      ledcWrite(PWM_BOMBA, BOMBA_VEL_MAX);
+    }
+    if (osc.osc == osc.veces - 1) {
+      ledcWrite(PWM_BOMBA, 0);
+      digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+    }
+    if (osc.osc >= osc.veces) {
+      osc.activo = false;
+      return false;
+    }
+  }
+  return true;
+}
+
+// ══════════════════════════════════════════
+// CONTEXTO MOTOR DC
+// ══════════════════════════════════════════
+struct MotorCtx {
+  bool  activo;
+  bool  adelante;
+  int   fase;
+  int   velActual;
+  unsigned long tiempoFin;
+  const char*   dir;
+} mdc;
+
+void motorInicia(float vueltas, bool adelante) {
+  mdc.adelante  = adelante;
+  mdc.dir       = adelante ? ">> Adelante" : "<< Atras";
+  mdc.fase      = 0;
+  mdc.velActual = MOTOR_VEL_MIN;
+  mdc.tiempoFin = millis() + (unsigned long)(vueltas * MS_POR_VUELTA);
+  mdc.activo    = true;
+  if (adelante) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+  else          { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+  ledcWrite(PWM_MOTOR, MOTOR_VEL_MIN);
+}
+
+// true = sigue, false = terminó
+bool motorTick() {
+  if (!mdc.activo) return false;
+  switch (mdc.fase) {
+    case 0:
+      mdc.velActual++;
+      ledcWrite(PWM_MOTOR, mdc.velActual);
+      if (mdc.velActual >= MOTOR_VEL_MAX) mdc.fase = 1;
+      break;
+    case 1:
+      if (millis() >= mdc.tiempoFin) mdc.fase = 2;
+      break;
+    case 2:
+      mdc.velActual--;
+      ledcWrite(PWM_MOTOR, mdc.velActual);
+      if (mdc.velActual <= MOTOR_VEL_MIN) {
+        ledcWrite(PWM_MOTOR, 0);
+        digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+        mdc.activo = false;
+        return false;
+      }
+      break;
+  }
+  return true;
+}
+
+// ══════════════════════════════════════════
+// OLED — rate-limited
+// ══════════════════════════════════════════
+void oledEstado(const char* pos, const char* accion) {
+  if (millis() - lastOled < 80) return;
+  lastOled = millis();
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 0); display.print("SARFBIO");
+  display.setCursor(98, 0); display.print("C:"); display.print(ciclo);
+  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+  display.setCursor(0, 11);  display.print(pos);
+  display.setCursor(72, 11); display.print(accion);
+  display.drawLine(42, 20, 42, 46, SSD1306_WHITE);
+  display.drawLine(85, 20, 85, 46, SSD1306_WHITE);
+  display.setTextSize(1); display.setCursor(2,  21); display.print("SA");
+  display.setTextSize(2); display.setCursor(0,  30);
+  if (angSA < 100) display.print(" ");
+  display.print(angSA); display.setTextSize(1); display.print((char)247);
+  display.setCursor(46, 21); display.print("SB");
+  display.setTextSize(2); display.setCursor(44, 30);
+  if (angSB < 100) display.print(" ");
+  display.print(angSB); display.setTextSize(1); display.print((char)247);
+  display.setCursor(89, 21); display.print("SC");
+  display.setTextSize(2); display.setCursor(87, 30);
+  if (angSC < 100) display.print(" ");
+  display.print(angSC); display.setTextSize(1); display.print((char)247);
+  display.drawLine(0, 47, 127, 47, SSD1306_WHITE);
+  display.setCursor(0, 49);
+  display.print("Step:"); display.print(posMotor); display.print("p");
+  int bStep = constrain(map(posMotor, -PASOS_90, PASOS_90, 0, 118), 0, 118);
+  display.drawRect(4, 57, 120, 6, SSD1306_WHITE);
+  display.fillRect(5, 58, bStep, 4, SSD1306_WHITE);
+  display.drawLine(63, 56, 63, 63, SSD1306_WHITE);
+  display.display();
+}
+
+// ══════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════
+void pausaIniciar(unsigned long ms) { pausaFin = millis() + ms; }
+bool pausaActiva()                  { return millis() < pausaFin; }
+
+void irAEstadoBrazo(int dSA, int dSB, int vel,
+                    const char* pos, const char* accion,
+                    Estado sig) {
+  moverBrazoInicia(dSA, dSB, vel, pos, accion);
+  estadoSig = sig;
+  estado    = ST_WAIT_BRAZO;
+}
+
+void irAEstadoStep(long dest, Estado sig) {
+  stepper.enableOutputs();
+  stepper.moveTo(dest);
+  estadoSig = sig;
+  estado    = ST_WAIT_STEP;
+}
+
+// ══════════════════════════════════════════
+// SETUP
+// ══════════════════════════════════════════
+void setup() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    while (true);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(14, 2);  display.print("SARFBIO");
+  display.setCursor(4, 14);  display.print("SA Hombro  GPIO 14");
+  display.setCursor(4, 24);  display.print("SB Codo    GPIO 13");
+  display.setCursor(4, 34);  display.print("SC Pinza   GPIO 15");
+  display.setCursor(4, 44);  display.print("Step 28BYJ GPIO17-19");
+  display.setCursor(4, 54);  display.print("Bomba/Motor L298N");
+  display.display();
+  delay(2500);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+
+  stepper.setMaxSpeed(1400.0);
+  stepper.setAcceleration(500.0);
+  stepper.setCurrentPosition(0);
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  SA.setPeriodHertz(50); SA.attach(SA_PIN, MG90S_MIN, MG90S_MAX);
+  SA.write(90); angSA = 90;
+  SB.setPeriodHertz(50); SB.attach(SB_PIN, MG90S_MIN, MG90S_MAX);
+  SB.write(90); angSB = 90;
+  SC.setPeriodHertz(50); SC.attach(SC_PIN, SG90_MIN,  SG90_MAX);
+  SC.write(45); angSC = 45;
+
+  ledcSetup(PWM_MOTOR, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENB, PWM_MOTOR);
+  ledcWrite(PWM_MOTOR, 0);
+
+  ledcSetup(PWM_BOMBA, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENA, PWM_BOMBA);
+  ledcWrite(PWM_BOMBA, 0);
+
+  // Arranca moviendo a PA
+  irAEstadoBrazo(PA_SA, PA_SB, VEL_ARRANQUE,
+                 "PA Inicial", "llegando", ST_PA);
+  estado = ST_INIT;
+}
+
+// ══════════════════════════════════════════
+// LOOP — FSM no bloqueante
+// ══════════════════════════════════════════
+void loop() {
+
+  // Stepper corre siempre
+  stepper.run();
+  posMotor = stepper.currentPosition();
+
+  switch (estado) {
+
+    // ── INIT — arranque suave ────────────
+    case ST_INIT:
+      if (moverBrazoTick()) {
+        oledEstado(mv.pos, mv.accion);
+        delay(mv.velBase);
+      } else {
+        stepper.setCurrentPosition(0);
+        posMotor = 0;
+        pausaIniciar(1000);
+        estadoSig = ST_PA;
+        estado    = ST_WAIT_PAUSA;
+      }
+      break;
+
+    // ── PA — posición inicial ────────────
+    case ST_PA:
+      irAEstadoBrazo(PA_SA, PA_SB, VEL_LENTO,
+                     "PA Inicial", "moviendo", ST_STEP_DER);
+      break;
+
+    // ── STEP DER — gira +90° ────────────
+    case ST_STEP_DER:
+      irAEstadoStep(PASOS_90, ST_PB_BRAZO);
+      break;
+
+    // ── PB BRAZO ────────────────────────
+    case ST_PB_BRAZO:
+      irAEstadoBrazo(PB_SA, PB_SB, VEL_LENTO,
+                     "PB Riego alto", "moviendo", ST_PB_RIEGO);
+      break;
+
+    // ── PB RIEGO ────────────────────────
+    case ST_PB_RIEGO:
+      oscIniciar(PB_SC_MIN, PB_SC_MAX, OSCILACIONES,
+                 VEL_NORMAL, "PB Riego alto");
+      estadoSig = ST_PA_DESDE_PB;
+      estado    = ST_WAIT_OSC;
+      break;
+
+    // ── PA DESDE PB ─────────────────────
+    case ST_PA_DESDE_PB:
+      irAEstadoBrazo(PA_SA, PA_SB, VEL_LENTO,
+                     "PA Inicial", "moviendo", ST_STEP_0_A);
+      break;
+
+    // ── STEP 0 A ────────────────────────
+    case ST_STEP_0_A:
+      irAEstadoStep(0, ST_STEP_IZQ);
+      break;
+
+    // ── STEP IZQ — gira -90° ────────────
+    case ST_STEP_IZQ:
+      irAEstadoStep(-PASOS_90, ST_PC_BRAZO);
+      break;
+
+    // ── PC BRAZO ────────────────────────
+    case ST_PC_BRAZO:
+      irAEstadoBrazo(PC_SA, PC_SB, VEL_LENTO,
+                     "PC Riego bajo", "moviendo", ST_PC_RIEGO);
+      break;
+
+    // ── PC RIEGO ────────────────────────
+    case ST_PC_RIEGO:
+      oscIniciar(PC_SC_MIN, PC_SC_MAX, OSCILACIONES,
+                 VEL_NORMAL, "PC Riego bajo");
+      estadoSig = ST_PA_DESDE_PC;
+      estado    = ST_WAIT_OSC;
+      break;
+
+    // ── PA DESDE PC ─────────────────────
+    case ST_PA_DESDE_PC:
+      irAEstadoBrazo(PA_SA, PA_SB, VEL_LENTO,
+                     "PA Inicial", "moviendo", ST_STEP_0_B);
+      break;
+
+    // ── STEP 0 B ────────────────────────
+    case ST_STEP_0_B:
+      irAEstadoStep(0, ST_MOTOR_AVZ);
+      break;
+
+    // ── MOTOR AVANZA ────────────────────
+    case ST_MOTOR_AVZ:
+      oledEstado("Motor DC", "avanzando >>>");
+      motorInicia(MOTOR_VUELTA, true);
+      estadoSig = ST_CICLO_INC;
+      estado    = ST_WAIT_MOTOR;
+      break;
+
+    // ── CICLO INC ───────────────────────
+    case ST_CICLO_INC:
+      ciclo++;
+      {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "ciclo=%d", ciclo);
+        oledEstado("Ciclo", buf);
+      }
+      pausaIniciar(1000);
+      estadoSig = (ciclo >= 3) ? ST_MOTOR_RET : ST_PA;
+      estado    = ST_WAIT_PAUSA;
+      break;
+
+    // ── MOTOR RETROCEDE ─────────────────
+    case ST_MOTOR_RET:
+      oledEstado("Motor DC", "reversa <<<");
+      motorInicia(3.0f * MOTOR_VUELTA, false);
+      estadoSig = ST_RESET_CICLO;
+      estado    = ST_WAIT_MOTOR;
+      break;
+
+    // ── RESET CICLO ─────────────────────
+    case ST_RESET_CICLO:
+      ciclo = 0;
+      oledEstado("Reset", "ciclo=0");
+      pausaIniciar(1000);
+      estadoSig = ST_PA;
+      estado    = ST_WAIT_PAUSA;
+      break;
+
+    // ════════════════════════════════════
+    // ESTADOS DE ESPERA GENÉRICOS
+    // ════════════════════════════════════
+
+    case ST_WAIT_BRAZO:
+      if (moverBrazoTick()) {
+        oledEstado(mv.pos, mv.accion);
+        delay(mv.velBase);
+      } else {
+        oledEstado(mv.pos, "OK");
+        pausaIniciar(400);
+        // espera breve y luego sigue
+        // reutilizamos ST_WAIT_PAUSA para la micro-pausa
+        // guardando estadoSig intacto
+        Estado sig = estadoSig;
+        estadoSig  = sig;
+        estado     = ST_WAIT_PAUSA;
+      }
+      break;
+
+    case ST_WAIT_PAUSA:
+      if (!pausaActiva()) estado = estadoSig;
+      break;
+
+    case ST_WAIT_STEP:
+      if (stepper.distanceToGo() != 0) {
+        oledEstado("Girando",
+                   stepper.distanceToGo() > 0 ?
+                   ">>> derecha" : "<<< izquierda");
+      } else {
+        stepper.disableOutputs();
+        pausaIniciar(2000);
+        estado = ST_WAIT_PAUSA;
+        // estadoSig ya está seteado por irAEstadoStep()
+      }
+      break;
+
+    case ST_WAIT_OSC:
+      if (oscTick()) {
+        oledEstado(osc.pos, "regando...");
+        delay(osc.vel);
+      } else {
+        oledEstado(osc.pos, "OK");
+        pausaIniciar(800);
+        estado = ST_WAIT_PAUSA;
+      }
+      break;
+
+    case ST_WAIT_MOTOR:
+      if (motorTick()) {
+        oledEstado("Motor DC", mdc.dir);
+        delay(2);
+      } else {
+        pausaIniciar(500);
+        estado = ST_WAIT_PAUSA;
+      }
+      break;
+  }
+}
