@@ -1,0 +1,387 @@
+````markdown
+# 🧠 SARFBIO — Sistema Robótico Autónomo de Riego (ESP32)
+### Documento técnico de contexto para modelos LLM / ingeniería embebida
+
+---
+
+## 1. 🎯 Propósito del sistema
+
+SARFBIO es un sistema embebido autónomo cuyo objetivo es:
+
+- Ejecutar **riego distribuido en múltiples posiciones físicas**
+- Coordinar **movimiento robótico + locomoción + control hidráulico**
+- Mantener **estabilidad temporal en un entorno con múltiples PWM simultáneos**
+
+El diseño resuelve un problema típico en ESP32:
+
+> ⚠️ Conflictos entre PWM (servos vs LEDC), I2C (OLED) y control de motores en tiempo casi real
+
+---
+
+## 2. 🧩 Modelo del sistema (visión de alto nivel)
+
+El sistema puede modelarse como:
+
+```text
+S = {C, A, V, T, Ω}
+````
+
+Donde:
+
+* **C**: Controlador (ESP32)
+* **A**: Actuadores (Servos, Stepper, DC, Bomba)
+* **V**: Visualización (OLED)
+* **T**: Temporización (delays + microdelays)
+* **Ω**: Lógica de secuencia (ciclo operativo)
+
+---
+
+## 3. 🔧 Componentes físicos
+
+### 3.1 Controlador
+
+* ESP32 (dual core, múltiples timers PWM)
+
+---
+
+### 3.2 Actuadores
+
+#### 🔹 Servos (cinemática del brazo)
+
+| ID | Función | GPIO | Tipo  | Rango  |
+| -- | ------- | ---- | ----- | ------ |
+| SA | Hombro  | 14   | MG90S | 0–180° |
+| SB | Codo    | 13   | MG90S | 0–180° |
+| SC | Pinza   | 15   | SG90  | 0–180° |
+
+---
+
+#### 🔹 Stepper
+
+* Modelo: 28BYJ-48 + ULN2003
+* Resolución real: 2048 pasos/vuelta
+
+```cpp
+#define STEP_PIN1 19  // IN1
+#define STEP_PIN2  5  // IN3
+#define STEP_PIN3 18  // IN2
+#define STEP_PIN4 17  // IN4
+#define PASOS_90 512
+```
+
+✔ Orden de pines **no trivial** → define sentido de giro
+✔ Error en este orden ⇒ rotación incorrecta o unidireccional
+
+---
+
+#### 🔹 Driver L298N
+
+| Canal | Uso      | Control         |
+| ----- | -------- | --------------- |
+| A     | Bomba    | PWM + dirección |
+| B     | Motor DC | PWM + dirección |
+
+---
+
+#### 🔹 Pantalla
+
+* OLED SSD1306 (I2C)
+* Alta latencia relativa → debe optimizarse
+
+---
+
+## 4. 📚 Stack de software
+
+```cpp
+Wire                → I2C
+Adafruit_SSD1306    → UI
+ESP32Servo          → PWM servos (timers internos)
+AccelStepper        → control stepper no bloqueante
+```
+
+---
+
+## 5. ⚙️ Problema central de ingeniería
+
+### 🔥 Conflicto multi-temporal
+
+El sistema ejecuta simultáneamente:
+
+| Subsistema | Requisito          |
+| ---------- | ------------------ |
+| Servos     | PWM estable (50Hz) |
+| Stepper    | stepping continuo  |
+| OLED       | I2C bloqueante     |
+| Motor DC   | PWM variable       |
+| Bomba      | PWM progresivo     |
+
+---
+
+### ⚠️ Efectos sin optimización
+
+* Vibración de servos (jitter)
+* Stepper inconsistente
+* OLED bloqueando ejecución
+* PWM corrompido por timers compartidos
+
+---
+
+## 6. 🧠 Estrategia de solución (core del diseño)
+
+### 6.1 Aislamiento de timers (CRÍTICO)
+
+```cpp
+ESP32PWM::allocateTimer(0..3);
+```
+
+✔ Evita que LEDC sobrescriba timers de servos
+✔ Estabiliza completamente el brazo
+
+---
+
+### 6.2 Separación de canales PWM
+
+```cpp
+PWM_BOMBA = 6
+PWM_MOTOR = 7
+```
+
+✔ Evita colisión con timers internos de ESP32Servo
+
+---
+
+### 6.3 Control de frecuencia
+
+```cpp
+PWM_FREQ = 500 Hz
+```
+
+✔ Reduce ruido eléctrico
+✔ Compatible con L298N
+
+---
+
+### 6.4 Reducción de carga I2C (OLED)
+
+```cpp
+if (i % N == 0)
+```
+
+✔ Disminuye llamadas a `display()`
+✔ Evita bloqueo del loop de control
+
+---
+
+### 6.5 Estabilización de servos (micro-delay)
+
+```cpp
+delayMicroseconds(500);
+```
+
+✔ Permite asentamiento del pulso PWM
+✔ Elimina micro-oscilaciones
+
+---
+
+### 6.6 Pseudo-concurrencia
+
+El sistema NO es concurrente real, pero simula concurrencia mediante:
+
+* Stepper → `run()` incremental
+* Servos → actualización intercalada
+* OLED → throttling
+* PWM → continuo por hardware
+
+---
+
+## 7. 🤖 Modelo cinemático del brazo
+
+Sistema de 2 DOF:
+
+```text
+θ = {θSA, θSB}
+```
+
+Movimiento implementado mediante:
+
+### 🔹 Interpolación proporcional
+
+```text
+ratioSA = distSA / maxDist
+ratioSB = distSB / maxDist
+```
+
+✔ Movimiento sincronizado
+✔ Trayectoria suave (sin saltos)
+
+---
+
+## 8. 🌊 Lógica de riego
+
+### Oscilación SC
+
+Movimiento periódico:
+
+```text
+SC(t) = oscilación triangular entre [min, max]
+```
+
+### Sincronización bomba
+
+| Evento               | Acción    |
+| -------------------- | --------- |
+| Inicio oscilación    | bomba ON  |
+| Penúltima oscilación | bomba OFF |
+
+✔ Evita sobre-riego
+✔ Simula barrido de agua
+
+---
+
+## 9. 🔄 Control del Stepper
+
+Modelo:
+
+```text
+posición(t+1) = posición(t) + Δ
+```
+
+Implementación:
+
+```cpp
+motor.moveTo(destino);
+motor.run();
+```
+
+### Dirección
+
+| destino | sentido   |
+| ------- | --------- |
+| >0      | derecha   |
+| <0      | izquierda |
+
+---
+
+## 10. ⚙️ Motor DC (cinemática lineal)
+
+Control basado en tiempo:
+
+```text
+t = vueltas × MS_POR_VUELTA
+```
+
+### Características:
+
+* Rampa de aceleración/desaceleración
+* PWM progresivo
+* Sin realimentación (open-loop)
+
+---
+
+## 11. 🔁 Máquina de estados implícita
+
+Aunque no está formalizada, el sistema sigue:
+
+```text
+STATE = {
+  PA,
+  STEP_RIGHT,
+  PB,
+  RETURN_PA,
+  STEP_LEFT,
+  PC,
+  RETURN_HOME,
+  MOVE_FORWARD,
+  CHECK_CYCLE
+}
+```
+
+---
+
+## 12. 🔄 Flujo operativo completo
+
+```text
+1. Inicialización (calibración servos)
+2. PA (reposo)
+3. Stepper → derecha
+4. PB (riego alto)
+5. PA
+6. Stepper → centro
+7. Stepper → izquierda
+8. PC (riego bajo)
+9. PA
+10. Stepper → centro
+11. Motor DC → avance
+12. Incremento ciclo
+13. Cada 3 ciclos → retroceso
+```
+
+---
+
+## 13. 📊 Variables críticas
+
+| Variable     | Impacto               |
+| ------------ | --------------------- |
+| delay()      | suavidad vs velocidad |
+| PWM_FREQ     | ruido eléctrico       |
+| maxSpeed     | estabilidad stepper   |
+| OLED refresh | bloqueo del sistema   |
+
+---
+
+## 14. ⚠️ Limitaciones del sistema
+
+* Arquitectura bloqueante (uso intensivo de `delay`)
+* Sin sensores (open-loop completo)
+* Sin control de errores
+* Dependencia fuerte de calibración empírica
+
+---
+
+## 15. 🧠 Insight clave del proyecto
+
+> El problema no era el movimiento del servo, sino la **competencia por recursos temporales del ESP32**
+
+La solución no fue cambiar lógica de movimiento, sino:
+
+✔ Reorganizar timers
+✔ Reducir carga I/O
+✔ Introducir micro-delays estratégicos
+
+---
+
+## 16. 🚀 Posibles mejoras
+
+### Nivel 1
+
+* Reemplazar `delay()` por `millis()`
+* FSM explícita
+
+### Nivel 2
+
+* Scheduler cooperativo
+* Control no bloqueante completo
+
+### Nivel 3
+
+* Sensores (humedad, posición)
+* Control cerrado (PID)
+
+---
+
+## 17. 🧾 Conclusión
+
+SARFBIO es un sistema embebido que:
+
+* Integra múltiples actuadores heterogéneos
+* Resuelve conflictos de temporización en ESP32
+* Implementa un modelo funcional de riego autónomo
+
+Desde el punto de vista de ingeniería:
+
+> Es un caso práctico de **coordinación multi-dispositivo en microcontroladores con recursos compartidos**, donde la solución depende más de la **gestión temporal** que de la lógica algorítmica.
+
+---
+
+```
+```
