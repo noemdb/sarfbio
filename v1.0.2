@@ -1,0 +1,640 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include <AccelStepper.h>
+
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1
+#define SCREEN_ADDRESS 0x3C
+
+// ── SA — Hombro  GPIO 14 — MG90S ──
+#define SA_PIN     14
+#define SA_MIN      0
+#define SA_MAX    180
+
+// ── SB — Codo    GPIO 13 — MG90S ──
+#define SB_PIN     13
+#define SB_MIN      0
+#define SB_MAX    180
+
+// ── SC — Pinza   GPIO 15 — SG90 ──
+#define SC_PIN     15
+#define SC_MIN      0
+#define SC_MAX    180
+
+#define MG90S_MIN  500
+#define MG90S_MAX  2400
+#define SG90_MIN   544
+#define SG90_MAX  2400
+
+// ── Stepper 28BYJ-48 ──
+#define STEP_PIN1 19  // IN1
+#define STEP_PIN2  5  // IN3
+#define STEP_PIN3 18  // IN2
+#define STEP_PIN4 17  // IN4
+#define PASOS_90 512
+
+// ── L298N Canal A — Bomba ──
+#define ENA  25
+#define IN1  26
+#define IN2  27
+
+// ── L298N Canal B — Motor DC ──
+#define ENB  16
+#define IN3   4
+#define IN4   2
+
+// ── PWM LEDC ──
+#define PWM_BOMBA   6
+#define PWM_MOTOR   7
+#define PWM_FREQ  500
+#define PWM_RES      8    // 0-255
+
+// ── Posición A — Inicial ──
+#define PA_SA   45
+#define PA_SB   90
+
+// ── Posición B — Riego alto ──
+#define PB_SA       110
+#define PB_SB       160
+#define PB_SC_MIN    45
+#define PB_SC_MAX    90
+
+// ── Posición C — Riego bajo ──
+#define PC_SA       120
+#define PC_SB        90
+#define PC_SC_MIN    45
+#define PC_SC_MAX    90
+
+#define OSCILACIONES  5
+
+// ── Motor DC ──
+// 1 vuelta rueda = ~213mm (6.8cm diámetro × π)
+// A 200RPM con PWM=200 ≈ ajustar según prueba
+#define MOTOR_VEL_MAX   220   // PWM máximo (0-255)
+#define MOTOR_VEL_MIN   150   // PWM mínimo funcional
+#define BOMBA_VEL_MAX    90   // Bomba — mitad de 180
+#define MOTOR_VUELTA     1.5   // vueltas
+
+// Ajustar MS_POR_VUELTA según motor real
+#define MS_POR_VUELTA   400
+
+// Velocidades servos
+#define VEL_ARRANQUE  50
+#define VEL_LENTO     25
+#define VEL_NORMAL    15
+
+// ─────────────────────────────────────────
+// OBJETOS
+// ─────────────────────────────────────────
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Servo SA;
+Servo SB;
+Servo SC;
+AccelStepper motor(AccelStepper::FULL4WIRE,
+                   STEP_PIN1, STEP_PIN2,
+                   STEP_PIN3, STEP_PIN4);
+
+int  angSA   = 90;
+int  angSB   = 90;
+int  angSC   = 45;
+long posMotor = 0;
+int  ciclo    = 0;
+
+// ─────────────────────────────────────────
+// OLED — servos + stepper + ciclo
+// ─────────────────────────────────────────
+void oledEstado(const char* pos, const char* accion) {
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 0);
+  display.print("SARFBIO");
+  display.setCursor(98, 0);
+  display.print("C:");
+  display.print(ciclo);
+  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+
+  display.setCursor(0, 11);
+  display.print(pos);
+  display.setCursor(72, 11);
+  display.print(accion);
+
+  display.drawLine(42, 20, 42, 46, SSD1306_WHITE);
+  display.drawLine(85, 20, 85, 46, SSD1306_WHITE);
+
+  // SA
+  display.setTextSize(1);
+  display.setCursor(2, 21);
+  display.print("SA");
+  display.setTextSize(2);
+  display.setCursor(0, 30);
+  if (angSA < 100) display.print(" ");
+  display.print(angSA);
+  display.setTextSize(1);
+  display.print((char)247);
+
+  // SB
+  display.setCursor(46, 21);
+  display.print("SB");
+  display.setTextSize(2);
+  display.setCursor(44, 30);
+  if (angSB < 100) display.print(" ");
+  display.print(angSB);
+  display.setTextSize(1);
+  display.print((char)247);
+
+  // SC
+  display.setCursor(89, 21);
+  display.print("SC");
+  display.setTextSize(2);
+  display.setCursor(87, 30);
+  if (angSC < 100) display.print(" ");
+  display.print(angSC);
+  display.setTextSize(1);
+  display.print((char)247);
+
+  // Separador stepper
+  display.drawLine(0, 47, 127, 47, SSD1306_WHITE);
+
+  // Stepper
+  display.setCursor(0, 49);
+  display.print("Step:");
+  display.print(posMotor);
+  display.print("p");
+
+  int bStep = map(posMotor, -PASOS_90, PASOS_90, 0, 118);
+  bStep = constrain(bStep, 0, 118);
+  display.drawRect(4, 57, 120, 6, SSD1306_WHITE);
+  display.fillRect(5, 58, bStep, 4, SSD1306_WHITE);
+  display.drawLine(63, 56, 63, 63, SSD1306_WHITE);
+
+  display.display();
+}
+
+void oledBarra(const char* titulo,
+               const char* etiqueta,
+               int valor, int valMax) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(titulo);
+  display.setCursor(98, 0);
+  display.print("C:"); display.print(ciclo);
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  display.setCursor(0, 14);
+  display.print(etiqueta);
+  display.setTextSize(2);
+  display.setCursor(80, 12);
+  display.print(map(valor, 0, valMax, 0, 100));
+  display.print("%");
+  display.setTextSize(1);
+  int barra = map(valor, 0, valMax, 0, 118);
+  display.drawRect(4, 34, 120, 14, SSD1306_WHITE);
+  display.fillRect(5, 35, barra, 12, SSD1306_WHITE);
+  display.display();
+}
+
+// ─────────────────────────────────────────
+// BOMBA — rampa gradual
+// ─────────────────────────────────────────
+void bombaRampaSubir() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  for (int v = 0; v <= BOMBA_VEL_MAX; v += 2) {
+    ledcWrite(PWM_BOMBA, v);
+    delay(30);
+  }
+  ledcWrite(PWM_BOMBA, BOMBA_VEL_MAX);
+}
+
+void bombaRampaBajar() {
+  for (int v = BOMBA_VEL_MAX; v >= 0; v -= 2) {
+    ledcWrite(PWM_BOMBA, v);
+    delay(30);
+  }
+  ledcWrite(PWM_BOMBA, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+}
+
+// ─────────────────────────────────────────
+// MOTOR DC — rampa gradual
+// ─────────────────────────────────────────
+void motorRampa(int velIni, int velFin,
+                bool adelante,
+                const char* etiqueta,
+                int pausa = 20) {          // era 8 — ahora 20 más suave
+  if (adelante) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+  else          { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+
+  int paso = (velFin > velIni) ? 1 : -1;
+
+  for (int v = velIni; v != velFin + paso; v += paso) {
+    ledcWrite(PWM_MOTOR, v);
+
+    // Actualizar OLED cada 5 pasos — no en cada grado
+    // evita saturar I2C y ralentizar la rampa
+    if (abs(v - velIni) % 5 == 0) {
+      oledBarra("Motor DC", etiqueta, abs(v), MOTOR_VEL_MAX);
+    }
+
+    delay(pausa);
+  }
+}
+
+void motorFrenar() {
+  ledcWrite(PWM_MOTOR, 0);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// Girar N vueltas con rampa suave
+void motorVueltas(float vueltas, bool adelante) {
+  const char* dir = adelante ? ">> Adelante" : "<< Atras";
+  int tiempoTotal = (int)(vueltas * MS_POR_VUELTA);
+
+  // Dirección
+  if (adelante) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+  else          { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+
+  // Rampa subida — 50ms total
+  // pasos = MOTOR_VEL_MAX - MOTOR_VEL_MIN
+  // delay por paso = 50ms / pasos
+  int pasos = MOTOR_VEL_MAX - MOTOR_VEL_MIN;
+  int delayPaso = max(1, 50 / pasos);
+  for (int v = MOTOR_VEL_MIN; v <= MOTOR_VEL_MAX; v++) {
+    ledcWrite(PWM_MOTOR, v);
+    delay(delayPaso);
+  }
+  oledBarra("Motor DC", dir, MOTOR_VEL_MAX, MOTOR_VEL_MAX);
+
+  // Mantener el tiempo calculado
+  delay(tiempoTotal);
+
+  // Rampa bajada — 50ms total
+  for (int v = MOTOR_VEL_MAX; v >= MOTOR_VEL_MIN; v--) {
+    ledcWrite(PWM_MOTOR, v);
+    delay(delayPaso);
+  }
+
+  // Apagar
+  ledcWrite(PWM_MOTOR, 0);
+  motorFrenar();
+  delay(200);
+}
+
+// ─────────────────────────────────────────
+// SERVOS — movimiento armónico SA + SB
+// ─────────────────────────────────────────
+void moverBrazo(int destSA, int destSB,
+                int velBase,
+                const char* pos,
+                const char* accion) {
+
+  destSA = constrain(destSA, SA_MIN, SA_MAX);
+  destSB = constrain(destSB, SB_MIN, SB_MAX);
+
+  int startSA = angSA;
+  int startSB = angSB;
+
+  int distSA = destSA - startSA;
+  int distSB = destSB - startSB;
+
+  int pasos = max(abs(distSA), abs(distSB));
+  if (pasos == 0) return;
+
+  for (int i = 0; i <= pasos; i++) {
+
+    // 🔥 factor normalizado 0 → 1
+    float t = (float)i / pasos;
+
+    // 🔥 curva suave (coseno)
+    float smooth = (1 - cos(t * PI)) * 0.5;
+
+    // 🔥 interpolación suave
+    angSA = startSA + distSA * smooth;
+    angSB = startSB + distSB * smooth;
+
+    SA.write(angSA);
+    SB.write(angSB);
+
+    delayMicroseconds(500); // estabilización PWM
+
+    // OLED optimizado
+    if (i % 4 == 0) {
+      oledEstado(pos, accion);
+    }
+
+    // 🔥 velocidad variable (más lento al inicio/fin)
+    int vel = velBase + (1 - smooth) * 10;
+    delay(vel);
+  }
+
+  angSA = destSA;
+  angSB = destSB;
+
+  SA.write(angSA);
+  SB.write(angSB);
+
+  oledEstado(pos, accion);
+  delay(300);
+}
+
+// ─────────────────────────────────────────
+// SC — oscilación riego + bomba integrada
+// La bomba sube al inicio, baja antes del fin
+// ─────────────────────────────────────────
+void oscilarSCconBomba(int minAng, int maxAng,
+                       int veces, int vel,
+                       const char* pos) {
+  // Ciclo 1 — bomba sube durante primera oscilación
+  for (int osc = 0; osc < veces; osc++) {
+
+    // Abrir pinza
+    for (int a = angSC; a <= maxAng; a++) {
+      angSC = a;
+      SC.write(angSC); delayMicroseconds(500);
+      oledEstado(pos, "regando...");
+      delay(vel);
+    }
+    delay(200);
+
+    // Cerrar pinza
+    for (int a = angSC; a >= minAng; a--) {
+      angSC = a;
+      SC.write(angSC); delayMicroseconds(500);
+      oledEstado(pos, "regando...");
+      delay(vel);
+    }
+    delay(200);
+
+    // Bomba: sube en oscilación 1, baja en oscilación (veces-1)
+    if (osc == 0) {
+      bombaRampaSubir();
+    }
+    if (osc == veces - 2) {
+      bombaRampaBajar();
+    }
+  }
+}
+
+// ─────────────────────────────────────────
+// STEPPER — mover con OLED
+// ─────────────────────────────────────────
+void moverStepper(long destino,
+                  const char* pos,
+                  const char* accion) {
+  motor.enableOutputs();
+  motor.moveTo(destino);
+
+  // mientras haya distancia pendiente
+  while (motor.distanceToGo() != 0) {
+    motor.run();               // Stepper avanza un micro-paso
+    posMotor = motor.currentPosition();
+
+    // 🔥 actualizar OLED solo cada 3 pasos para no saturar I2C
+    static int contador = 0;
+    if (contador++ % 3 == 0) {
+      oledEstado(pos, accion);
+    }
+
+    // 🔥 actualizar servos SA y SB suavemente durante el movimiento
+    if (angSA != PA_SA || angSB != PA_SB) {
+      SA.write(angSA);
+      SB.write(angSB);
+      delayMicroseconds(300);  // breve estabilización PWM
+    }
+  }
+
+  posMotor = motor.currentPosition();
+  oledEstado(pos, accion);
+  motor.disableOutputs();
+  delay(400);
+}
+
+// ─────────────────────────────────────────
+// ARRANQUE SUAVE
+// ─────────────────────────────────────────
+void arranqueSuave() {
+
+  // Cuenta regresiva en OLED
+  for (int i = 3; i >= 1; i--) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(22, 8);
+    display.print("Iniciando en...");
+    display.setTextSize(4);
+    display.setCursor(54, 26);
+    display.print(i);
+    display.display();
+    delay(900);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(14, 26);
+  display.print("Calibrando...");
+  display.display();
+  delay(400);
+
+  // Servos — timers primero
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  SA.setPeriodHertz(50);
+  SA.attach(SA_PIN, MG90S_MIN, MG90S_MAX);
+  SA.write(90);
+  angSA = 90;
+
+  SB.setPeriodHertz(50);
+  SB.attach(SB_PIN, MG90S_MIN, MG90S_MAX);
+  SB.write(90);
+  angSB = 90;
+
+  SC.setPeriodHertz(50);
+  SC.attach(SC_PIN, SG90_MIN, SG90_MAX);
+  SC.write(45);
+  angSC = 45;
+
+  // Motor DC y Bomba DESPUÉS de los servos
+  // ESP32PWM reasigna timers LEDC — reconectar aquí
+  ledcSetup(PWM_MOTOR, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENB, PWM_MOTOR);
+  ledcWrite(PWM_MOTOR, 0);
+
+  ledcSetup(PWM_BOMBA, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENA, PWM_BOMBA);
+  ledcWrite(PWM_BOMBA, 0);
+
+  oledEstado("Inicio", "neutro 90");
+  delay(1200);
+
+  // Servos van suavemente a PA
+  moverBrazo(PA_SA, PA_SB, VEL_ARRANQUE,
+             "PA Inicial", "llegando");
+
+  // Stepper en posición 0
+  motor.setCurrentPosition(0);
+  posMotor = 0;
+  oledEstado("PA Inicial", "Step:0");
+  delay(1000);
+}
+// ─────────────────────────────────────────
+// POSICIONES
+// ─────────────────────────────────────────
+void posicionA() {
+  moverBrazo(PA_SA, PA_SB, VEL_LENTO,
+             "PA Inicial", "moviendo");
+  oledEstado("PA Inicial", "OK");
+  delay(1200);
+}
+
+void posicionB() {
+  moverBrazo(PB_SA, PB_SB, VEL_LENTO,
+             "PB Riego alto", "moviendo");
+  oledEstado("PB Riego alto", "SA SB OK");
+  delay(600);
+  oscilarSCconBomba(PB_SC_MIN, PB_SC_MAX,
+                    OSCILACIONES, VEL_NORMAL,
+                    "PB Riego alto");
+  oledEstado("PB Riego alto", "OK");
+  delay(800);
+}
+
+void posicionC() {
+  moverBrazo(PC_SA, PC_SB, VEL_LENTO,
+             "PC Riego bajo", "moviendo");
+  oledEstado("PC Riego bajo", "SA SB OK");
+  delay(600);
+  oscilarSCconBomba(PC_SC_MIN, PC_SC_MAX,
+                    OSCILACIONES, VEL_NORMAL,
+                    "PC Riego bajo");
+  oledEstado("PC Riego bajo", "OK");
+  delay(800);
+}
+
+// ─────────────────────────────────────────
+// SETUP
+// ─────────────────────────────────────────
+void setup() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(14, 2);  display.print("SARFBIO");
+  display.setCursor(4, 14);  display.print("SA Hombro  GPIO 14");
+  display.setCursor(4, 24);  display.print("SB Codo    GPIO 13");
+  display.setCursor(4, 34);  display.print("SC Pinza   GPIO 15");
+  display.setCursor(4, 44);  display.print("Step 28BYJ GPIO17-19");
+  display.setCursor(4, 54);  display.print("Bomba/Motor L298N");
+  display.display();
+  delay(2500);
+
+  // L298N pines
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+
+  // PWM LEDC
+//  ledcSetup(PWM_BOMBA, PWM_FREQ, PWM_RES);
+//  ledcAttachPin(ENA, PWM_BOMBA);
+//  ledcWrite(PWM_BOMBA, 0);
+//
+//  ledcSetup(PWM_MOTOR, PWM_FREQ, PWM_RES);
+//  ledcAttachPin(ENB, PWM_MOTOR);
+//  ledcWrite(PWM_MOTOR, 0);
+
+  // Stepper
+  motor.setMaxSpeed(1400.0);
+  motor.setAcceleration(500.0);
+  motor.setCurrentPosition(0);
+  posMotor = 0;
+
+  arranqueSuave();
+}
+
+// ─────────────────────────────────────────
+// LOOP — secuencia completa
+// ─────────────────────────────────────────
+void loop() {
+
+  //motorVueltas(MOTOR_VUELTA, true);
+
+  // ── Paso 1: PA — todo detenido ──────────
+  posicionA();
+  motor.disableOutputs();
+  oledEstado("PA Inicial", "Step:0 OK");
+  delay(2000);
+
+  // ── Paso 2: Stepper +90° derecha ────────
+  moverStepper(PASOS_90, "Girando", ">>> derecha");
+  delay(2000);
+
+  // ── Paso 3+4: PB — riego alto + bomba ───
+  posicionB();
+  delay(2000);
+
+  // ── Paso 5: Regresa a PA ─────────────────
+  posicionA();
+  delay(2000);
+
+  // ── Paso 6: Stepper regresa a 0 ─────────
+  moverStepper(0, "Girando", "<<< origen");
+  motor.disableOutputs();
+  oledEstado("PA Inicial", "Step:0");
+  delay(2000);
+
+  // ── Paso 7: Stepper -90° izquierda ──────
+  moverStepper(-PASOS_90, "Girando", "<<< izquierda");
+  delay(2000);
+
+  // ── Paso 8+9: PC — riego bajo + bomba ───
+  posicionC();
+  delay(2000);
+
+  // ── Paso 10: Regresa a PA ────────────────
+  posicionA();
+  delay(2000);
+
+  // ── Paso 11: Stepper regresa a 0 ────────
+  moverStepper(0, "Girando", ">>> origen");
+  motor.disableOutputs();
+  oledEstado("Ciclo OK", "Pausa...");
+  delay(2000);
+
+  // ── Paso 12: Motor DC 2 vueltas adelante ─
+  oledEstado("Motor DC", "1 vueltas >>>");
+  motorVueltas(MOTOR_VUELTA, true);
+  delay(500);
+
+  // ── Paso 13: incrementar ciclo ───────────
+  ciclo++;
+  oledEstado("Ciclo", String("ciclo=" + String(ciclo)).c_str());
+  delay(1000);
+
+  
+
+  // ── Al tercer ciclo: retroceder 6 vueltas ─
+  if (ciclo >= 3) {
+    oledEstado("Motor DC", " reverza <<<");
+    motorVueltas(3 * MOTOR_VUELTA, false);
+    delay(500);
+    ciclo = 0;
+    oledEstado("Reset", "ciclo=0");
+    delay(1000);
+    exit;
+  }
+}
