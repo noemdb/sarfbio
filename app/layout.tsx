@@ -35,6 +35,9 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'SARFBIO — Robot AgriTech Venezuela',
   },
+  icons: {
+    icon: '/asset/favicon.png',
+  },
   robots: { index: true, follow: true },
 }
 
