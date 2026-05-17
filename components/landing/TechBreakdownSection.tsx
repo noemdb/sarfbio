@@ -1,13 +1,7 @@
 'use client'
 // components/landing/TechBreakdownSection.tsx — Spec: spec_driven_v01.md Tarea 5.3
-import { Suspense } from 'react'
-import dynamic from 'next/dynamic'
 import type { TechBreakdownContent } from '@/types/content'
-
-const ExplodedView3D = dynamic(
-  () => import('@/features/exploded/ExplodedView3D').then((m) => m.ExplodedView3D),
-  { ssr: false, loading: () => <div style={{ height: '700px' }} /> }
-)
+import { ExplodedViewSVG } from './ExplodedViewSVG'
 
 const CATEGORY_COLORS: Record<string, string> = {
   brain: 'var(--color-bio-green)',
@@ -117,11 +111,9 @@ export function TechBreakdownSection({ content }: TechBreakdownSectionProps) {
             </div>
           </div>
 
-          {/* Right: 3D exploded view */}
-          <div aria-hidden="true">
-            <Suspense fallback={<div style={{ height: '700px' }} />}>
-              <ExplodedView3D content={content} scrollRangeStart={0.55} scrollRangeEnd={0.8} />
-            </Suspense>
+          {/* Right: 2D exploded view blueprint */}
+          <div aria-hidden="true" className="w-full">
+            <ExplodedViewSVG content={content} />
           </div>
         </div>
       </div>
